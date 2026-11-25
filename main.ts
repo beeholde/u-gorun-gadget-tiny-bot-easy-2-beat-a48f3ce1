@@ -1,11 +1,13 @@
 // Tiny hourly bars bot for agent-fun/bars-replay/v1.
 //
 // Each batch the bot scores every symbol with a volatility-normalized blend of
-// EMA trend and multi-hour momentum, optionally discounted by how stretched
-// price is above its slow EMA. It holds the strongest few names while a
-// basket-trend gate is open, leaves on stop, trailing, take-profit or score
-// exits, and otherwise sits in cash. A small activity floor keeps the filled
-// trade count at the guardrail minimum when the market offers nothing.
+// EMA trend and stretch against its slow EMA: it buys names stretched far
+// below trend (dip entries), with the trend weight scaled by whether the
+// basket itself is trending. It holds the strongest few names at half gross,
+// leaves on stop, take-profit, max-hold, score or stretch exits, and
+// otherwise sits in cash. An equity drawdown latch stops all risk trading
+// once drawdown from the equity peak passes 12%, and a small activity floor
+// keeps the filled trade count at the guardrail minimum.
 //
 // The bot reads the hello and batches on stdin and answers each batch with one
 // reply line of orders for the next bar open. It keeps no state outside the
@@ -15,33 +17,39 @@
 const MAX_SLIPPAGE_BPS = 500;
 const MIN_ORDER_USD = 25;
 const FLOOR_USD = 100;
-const FLOOR_FROM_SEQ = 20;
+const FLOOR_FROM_SEQ = 10;
 const MIN_TRADES = 8;
+const LATCH_DRAWDOWN = 0.12;
 
 const P = {
-  fast: 6,
-  slow: 18,
-  momLookback: 12,
-  volWindow: 24,
-  wTrend: 1.0,
-  wMom: 0.5,
-  wStretch: 0.0,
-  stretchEntryZ: 9.0,
-  stretchExitZ: 9.0,
-  entryScore: 0.6,
-  exitScore: 0.0,
-  maxHoldings: 4,
-  gross: 1.0,
+  fast: 8,
+  slow: 24,
+  momLookback: 6,
+  volWindow: 36,
+  wTrend: 0.5,
+  wMom: 0.0,
+  wStretch: 1.0,
+  wReversal: 0.0,
+  stretchEntryZ: -1.5,
+  stretchExitZ: -0.2,
+  regimeThreshold: 0.5,
+  rangeTrendWeight: 0.3,
+  trendReversalWeight: 0.0,
+  entryScore: 0.0,
+  exitScore: 0.2,
+  maxHoldings: 3,
+  gross: 0.5,
   breadthScale: true,
   basketLookback: 24,
   basketGate: -1.0,
-  stopLoss: 0.06,
-  trailStop: 0.05,
-  takeProfit: 9.0,
-  cooldownBars: 6,
-  minBars: 8,
-  minHoldBars: 0,
-  rebalanceBand: 0.03,
+  stopLoss: 0.05,
+  trailStop: 0.5,
+  takeProfit: 0.05,
+  cooldownBars: 0,
+  minBars: 12,
+  minHoldBars: 2,
+  maxHoldBars: 24,
+  rebalanceBand: 0.04,
 };
 
 let hello = null;
@@ -56,6 +64,10 @@ const entrySeq = new Map();
 const cooldownUntil = new Map();
 let filledTrades = 0;
 let floorOpen = false;
+let floorSymbol = null;
+let equityPeak = 0;
+let latched = false;
+const indexLogs = [];
 let orderCounter = 0;
 
 function priceOf(symbol, raw) {
@@ -95,7 +107,7 @@ function volatility(symbol) {
   return sd < 0.002 ? 0.002 : sd;
 }
 
-function scoreOf(symbol) {
+function scoreOf(symbol, trendWeight, reversalWeight) {
   const list = closes.get(symbol);
   const n = list.length;
   if (n < P.minBars) return null;
@@ -105,26 +117,65 @@ function scoreOf(symbol) {
   const look = Math.min(P.momLookback, n - 1);
   const mom = look >= 2 ? (list[n - 1] / list[n - 1 - look] - 1) / Math.sqrt(look) : 0;
   const stretch = Math.log(list[n - 1] / slow) / (vol * Math.sqrt(P.slow / 2));
+  const reversal = n >= 2 ? -(list[n - 1] / list[n - 2] - 1) / vol : 0;
+  const reversal3 = n >= 4 ? -(list[n - 1] / list[n - 4] - 1) / (vol * Math.sqrt(3)) : 0;
   return {
-    score: (P.wTrend * trend + P.wMom * mom) / vol - P.wStretch * stretch,
+    score:
+      (P.wTrend * trendWeight * trend + P.wMom * trendWeight * mom) / vol -
+      P.wStretch * stretch +
+      P.wReversal * reversalWeight * (0.7 * reversal + 0.3 * reversal3),
     stretch,
   };
 }
 
-function basketTrend() {
+function recordIndexLog() {
   let now = 0;
-  let back = 0;
   let count = 0;
   for (const symbol of symbols) {
     const list = closes.get(symbol);
-    if (!list || list.length < 5) continue;
-    const lag = Math.min(P.basketLookback, list.length - 1);
+    if (!list || list.length === 0) continue;
     now += list[list.length - 1] / list[0];
-    back += list[list.length - 1 - lag] / list[0];
     count++;
   }
-  if (count === 0 || back <= 0) return 0;
-  return now / back - 1;
+  if (count > 0) indexLogs.push(Math.log(now / count));
+}
+
+function basketStats(seq) {
+  let trend = 0;
+  let vol = 0.01;
+  if (seq >= 4) {
+    let now = 0;
+    let back = 0;
+    let count = 0;
+    const lag = Math.min(P.basketLookback, seq);
+    for (const symbol of symbols) {
+      const list = closes.get(symbol);
+      if (!list || list.length === 0) continue;
+      now += list[list.length - 1] / list[0];
+      back += list[list.length - 1 - lag] / list[0];
+      count++;
+    }
+    if (count > 0 && back > 0) trend = now / back - 1;
+    const from = Math.max(1, indexLogs.length - 24);
+    const rets = [];
+    for (let i = from; i < indexLogs.length; i++) rets.push(indexLogs[i] - indexLogs[i - 1]);
+    if (rets.length >= 3) {
+      let mean = 0;
+      for (const r of rets) mean += r;
+      mean /= rets.length;
+      let sq = 0;
+      for (const r of rets) sq += (r - mean) * (r - mean);
+      const sd = Math.sqrt(sq / rets.length);
+      vol = sd < 0.001 ? 0.001 : sd;
+    }
+  }
+  const regime = trend / (vol * Math.sqrt(P.basketLookback));
+  const trending = regime > P.regimeThreshold;
+  return {
+    trend,
+    trendWeight: trending ? 1.0 : P.rangeTrendWeight,
+    reversalWeight: trending ? P.trendReversalWeight : 1.0,
+  };
 }
 
 function nextClientId(seq) {
@@ -138,6 +189,8 @@ function decide(batch) {
   const account = batch.account;
   const cashUsd = Number(account.cash_quote_units) / 1e6;
   const equityUsd = Number(account.equity_quote_units) / 1e6;
+  if (equityUsd > equityPeak) equityPeak = equityUsd;
+  if (equityPeak > 0 && 1 - equityUsd / equityPeak > LATCH_DRAWDOWN) latched = true;
   const heldQty = new Map();
   const heldRaw = new Map();
   const heldCost = new Map();
@@ -155,8 +208,9 @@ function decide(batch) {
   }
   if (seq < warmup) return [];
 
+  const basket = basketStats(seq);
   const scores = new Map();
-  for (const symbol of symbols) scores.set(symbol, scoreOf(symbol));
+  for (const symbol of symbols) scores.set(symbol, scoreOf(symbol, basket.trendWeight, basket.reversalWeight));
 
   const orders = [];
   const exiting = new Set();
@@ -173,13 +227,17 @@ function decide(batch) {
     const age = seq - (entrySeq.get(symbol) ?? seq);
     const sc = scores.get(symbol);
     let exit = false;
-    if (pnlPct <= -P.stopLoss) {
+    if (latched) {
+      exit = true;
+    } else if (pnlPct <= -P.stopLoss) {
       exit = true;
       cooldownUntil.set(symbol, seq + P.cooldownBars);
     } else if (peakDd <= -P.trailStop && age >= 2) {
       exit = true;
       cooldownUntil.set(symbol, seq + P.cooldownBars);
     } else if (pnlPct >= P.takeProfit) {
+      exit = true;
+    } else if (age >= P.maxHoldBars) {
       exit = true;
     } else if (sc !== null && sc.score < P.exitScore && age >= P.minHoldBars) {
       exit = true;
@@ -199,20 +257,28 @@ function decide(batch) {
     });
     peakClose.delete(symbol);
     entrySeq.delete(symbol);
+    if (floorOpen && floorSymbol === symbol) {
+      floorOpen = false;
+      floorSymbol = null;
+    }
   }
 
-  if (basketTrend() > P.basketGate) {
+  let cashLeft = cashUsd;
+  const chosenSet = new Set();
+  if (basket.trend > P.basketGate && !latched) {
     const ranked = [];
     for (const symbol of symbols) {
       const sc = scores.get(symbol);
       if (sc === null || sc.score <= P.entryScore) continue;
       if (exiting.has(symbol)) continue;
       if (seq < (cooldownUntil.get(symbol) ?? -1)) continue;
+      if (floorOpen && floorSymbol === symbol) continue;
       if (P.wStretch > 0 && sc.stretch >= P.stretchEntryZ) continue;
       ranked.push({ symbol, score: sc.score });
     }
-    ranked.sort((a, b) => b.score - a.score || (a.symbol < b.symbol ? -1 : 1));
+    ranked.sort((a, b) => b.score - a.score || (a.symbol > b.symbol ? -1 : 1));
     const chosen = ranked.slice(0, P.maxHoldings).map((r) => r.symbol);
+    for (const symbol of chosen) chosenSet.add(symbol);
     let gross = P.gross;
     if (P.breadthScale) {
       let positive = 0;
@@ -227,7 +293,6 @@ function decide(batch) {
     }
     if (chosen.length > 0) {
       const weightEach = Math.min(hello.caps.max_weight_bps / 10000, gross / chosen.length);
-      let cashLeft = cashUsd;
       for (const symbol of chosen) {
         const close = latestClose(symbol);
         if (close === null) continue;
@@ -251,10 +316,9 @@ function decide(batch) {
     }
   }
 
-  if (seq >= FLOOR_FROM_SEQ && filledTrades < MIN_TRADES && orders.length === 0) {
-    const floorSymbol = symbols.includes("SOL") ? "SOL" : symbols[0];
-    if (floorSymbol && latestClose(floorSymbol) !== null) {
-      if (floorOpen && heldQty.has(floorSymbol)) {
+  if (seq >= FLOOR_FROM_SEQ && filledTrades < MIN_TRADES) {
+    if (floorOpen && floorSymbol !== null) {
+      if (heldQty.has(floorSymbol) && !exiting.has(floorSymbol)) {
         orders.push({
           side: "sell",
           client_id: nextClientId(seq),
@@ -262,16 +326,31 @@ function decide(batch) {
           qty: heldRaw.get(floorSymbol),
           max_slippage_bps: MAX_SLIPPAGE_BPS,
         });
+        peakClose.delete(floorSymbol);
+        entrySeq.delete(floorSymbol);
         floorOpen = false;
-      } else if (!heldQty.has(floorSymbol) && cashUsd >= FLOOR_USD) {
+        floorSymbol = null;
+      } else if (!heldQty.has(floorSymbol)) {
+        floorOpen = false;
+        floorSymbol = null;
+      }
+    }
+    if (!floorOpen && filledTrades < MIN_TRADES) {
+      for (const symbol of symbols) {
+        if (heldQty.has(symbol) || exiting.has(symbol) || chosenSet.has(symbol)) continue;
+        if (latestClose(symbol) === null || cashLeft < FLOOR_USD) continue;
         orders.push({
           side: "buy",
           client_id: nextClientId(seq),
-          symbol: floorSymbol,
+          symbol,
           notional_quote_units: String(FLOOR_USD * 1e6),
           max_slippage_bps: MAX_SLIPPAGE_BPS,
         });
+        cashLeft -= FLOOR_USD;
         floorOpen = true;
+        floorSymbol = symbol;
+        entrySeq.set(symbol, seq);
+        break;
       }
     }
   }
@@ -297,6 +376,7 @@ function handleLine(line) {
       closes.get(bar.symbol).push(close);
       updateEma(bar.symbol, close);
     }
+    recordIndexLog();
     for (const fill of msg.fills) {
       if (fill.status === "filled") filledTrades++;
     }
